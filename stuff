@@ -1,0 +1,270 @@
+from PIL import Image
+import torch
+from transformers import CLIPProcessor, CLIPModel, AutoImageProcessor, AutoModelForImageClassification
+import os
+import cv2
+import numpy as np
+# torchvision.transforms is not strictly needed if AutoImageProcessor handles all FairFace transforms
+# from torchvision import transforms
+
+# --- Configuration ---
+# Set device: "cuda" for GPU if available, otherwise "cpu"
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# Define CLIP's candidate tag labels
+clip_tag_categories = {
+    "gender": ["male", "female"],
+    "race": ["white", "black", "asian", "latino", "indian", "middle eastern"],
+    "setting": ["indoor", "outdoor", "day", "night", "hospital", "office"],
+    "lighting": ["natural light", "studio light", "low light", "bright light"],
+    "people": ["no people", "one person", "two people", "group of people"]
+}
+
+# FairFace model specific labels and mapping
+# These labels are based on the dima806/fairface_age_image_detection model's typical output
+FAIRFACE_MODEL_RACE_LABELS = ["White", "Black", "Asian", "Indian", "Hispanic", "Middle Eastern", "East Asian"]
+FAIRFACE_MODEL_GENDER_LABELS = ["Male", "Female"]
+
+# Define a mapping from FairFace model's labels to your desired prompt labels
+RACE_MAP = {
+    "White": "white",
+    "Black": "black",
+    "Asian": "asian",
+    "Indian": "indian",
+    "Hispanic": "latino",  # Mapping Hispanic to latino as per your preference
+    "Middle Eastern": "middle eastern",
+    "East Asian": "asian"  # Mapping East Asian to asian
+}
+GENDER_MAP = {
+    "Male": "male",
+    "Female": "female"
+}
+
+# --- Load Models ---
+
+# Load CLIP model and processor
+print("Loading CLIP model...")
+try:
+    clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
+    clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+    print("CLIP model loaded successfully.")
+except Exception as e:
+    print(f"Error loading CLIP model: {e}. Exiting.")
+    exit() # Exit if CLIP cannot be loaded, as it's fundamental
+
+# Load FairFace model and its processor
+print("Loading FairFace model...")
+fairface_model = None
+fairface_processor = None
+try:
+    fairface_model_id = "dima806/fairface_age_image_detection"
+    fairface_processor = AutoImageProcessor.from_pretrained(fairface_model_id)
+    fairface_model = AutoModelForImageClassification.from_pretrained(fairface_model_id).to(device)
+    fairface_model.eval() # Set model to evaluation mode
+    print(f"FairFace model '{fairface_model_id}' loaded successfully.")
+except Exception as e:
+    print(f"FAILED to load FairFace model '{fairface_model_id}': {e}")
+    print("Race and gender will be classified by CLIP only.")
+
+
+# --- Face Detection Setup (OpenCV DNN) ---
+# Ensure these files are in the same directory as your script
+FACE_DETECTOR_PROTOTXT = "deploy.prototxt"
+FACE_DETECTOR_CAFFEMODEL = "res10_300x300_ssd_iter_140000_fp16.caffemodel"
+
+face_net = None
+if os.path.exists(FACE_DETECTOR_PROTOTXT) and os.path.exists(FACE_DETECTOR_CAFFEMODEL):
+    print("Loading OpenCV DNN face detector...")
+    try:
+        face_net = cv2.dnn.readNetFromCaffe(FACE_DETECTOR_PROTOTXT, FACE_DETECTOR_CAFFEMODEL)
+        print("Face detector loaded.")
+    except Exception as e:
+        print(f"Error loading face detector: {e}. Face detection will be skipped.")
+else:
+    print("OpenCV DNN face detector files not found. Face detection will be skipped.")
+
+# --- Helper Functions ---
+
+def detect_faces(image_np):
+    if face_net is None:
+        return []
+
+    h, w = image_np.shape[:2]
+    # Blob conversion: Scale factor, target size, mean subtraction, swap RB
+    blob = cv2.dnn.blobFromImage(cv2.resize(image_np, (300, 300)), 1.0, (300, 300), (104.0, 177.0, 123.0), swapRB=False, crop=False)
+    face_net.setInput(blob)
+    detections = face_net.forward()
+    faces = []
+    for i in range(0, detections.shape[2]):
+        confidence = detections[0, 0, i, 2]
+        if confidence > 0.5: # Confidence threshold for detection
+            box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+            (startX, startY, endX, endY) = box.astype("int")
+            # Ensure bounding box coordinates are within image boundaries
+            startX, startY = max(0, startX), max(0, startY)
+            endX, endY = min(w, endX), min(h, endY)
+            faces.append((startX, startY, endX, endY))
+    return faces
+
+def predict_fairface(face_image_pil):
+    if fairface_model is None or fairface_processor is None:
+        return None, None # Cannot predict without model or its processor
+
+    try:
+        # Prepare inputs using the FairFace-specific processor (handles resizing, normalization)
+        inputs = fairface_processor(images=face_image_pil, return_tensors="pt").to(device)
+
+        with torch.no_grad():
+            outputs = fairface_model(**inputs)
+            logits = outputs.logits # Logits for all 9 categories (7 race + 2 gender)
+
+        # Assuming the model outputs 9 logits in the order: 7 race then 2 gender
+        num_race_classes_model = len(FAIRFACE_MODEL_RACE_LABELS)
+        num_gender_classes_model = len(FAIRFACE_MODEL_GENDER_LABELS)
+
+        race_logits_model = logits[:, :num_race_classes_model]
+        gender_logits_model = logits[:, num_race_classes_model:]
+
+        race_pred_idx = race_logits_model.argmax().item()
+        gender_pred_idx = gender_logits_model.argmax().item()
+
+        race_label_raw = FAIRFACE_MODEL_RACE_LABELS[race_pred_idx]
+        gender_label_raw = FAIRFACE_MODEL_GENDER_LABELS[gender_pred_idx]
+
+        # Map to your desired prompt labels
+        race_label = RACE_MAP.get(race_label_raw, "unknown race") # Use .get with fallback
+        gender_label = GENDER_MAP.get(gender_label_raw, "unknown gender")
+
+        return race_label, gender_label
+
+    except Exception as e:
+        print(f"Error predicting with FairFace: {e}")
+        return None, None
+
+def classify_with_clip(image_pil, category, candidates):
+    text_prompts = [f"A photo of {label}" for label in candidates]
+    inputs = clip_processor(text=text_prompts, images=image_pil, return_tensors="pt", padding=True).to(device)
+
+    with torch.no_grad():
+        outputs = clip_model(**inputs)
+        logits_per_image = outputs.logits_per_image
+        probs = logits_per_image.softmax(dim=1)
+
+    best_idx = probs.argmax().item()
+    return candidates[best_idx]
+
+def get_tags(image_path):
+    image_pil = Image.open(image_path).convert("RGB")
+    # Convert PIL to NumPy for OpenCV's face detection
+    image_np = np.array(image_pil)
+    # OpenCV uses BGR, PIL/torch uses RGB, so convert for detection if needed
+    # If your image_np is already RGB, you might not need cvtColor, but it's safer.
+    # cv2_image_bgr = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR) # Uncomment if issues with detection
+
+    tags = {}
+    fairface_used_for_demographics = False
+
+    # 1. Attempt to use FairFace for Race and Gender if models are loaded
+    if face_net and fairface_model and fairface_processor:
+        faces = detect_faces(image_np) # Use RGB image_np directly if no issues, or cv2_image_bgr
+        if len(faces) > 0:
+            # For simplicity, process the first detected face (often the largest/most central)
+            x1, y1, x2, y2 = faces[0]
+            face_crop_pil = image_pil.crop((x1, y1, x2, y2))
+            
+            fairface_race, fairface_gender = predict_fairface(face_crop_pil)
+            
+            if fairface_race and fairface_gender:
+                tags['race'] = fairface_race
+                tags['gender'] = fairface_gender
+                fairface_used_for_demographics = True
+                print(f"FairFace detected: Race='{fairface_race}', Gender='{fairface_gender}' (for largest face)")
+            else:
+                print("FairFace prediction for detected face failed. Falling back to CLIP for race/gender.")
+        else:
+            print("No faces detected by OpenCV. Falling back to CLIP for race/gender.")
+    else:
+        print("Face detector or FairFace model/processor not fully loaded. Falling back to CLIP for race/gender.")
+
+    # 2. Use CLIP for all categories, prioritizing FairFace results for race/gender if available
+    for category, labels in clip_tag_categories.items():
+        if category in ['race', 'gender'] and fairface_used_for_demographics:
+            # If FairFace already provided race/gender, skip CLIP for these
+            continue
+        else:
+            # Use CLIP for other categories or as a fallback for race/gender
+            tag = classify_with_clip(image_pil, category, labels)
+            tags[category] = tag
+    
+    # Ensure all categories are filled, especially if FairFace didn't provide race/gender (e.g., no face)
+    for category, labels in clip_tag_categories.items():
+        if category not in tags or tags[category] is None:
+            # This covers cases where FairFace wasn't used or failed,
+            # ensuring CLIP is the ultimate fallback for any missing tag.
+            tags[category] = classify_with_clip(image_pil, category, labels)
+
+    return tags
+
+def generate_prompt_from_tags(tags):
+    # Retrieve tags with a default fallback to prevent KeyError
+    race = tags.get('race', 'person') # 'person' as a neutral fallback if race is truly unknown
+    gender = tags.get('gender', '') # Empty string if gender is truly unknown, will just be "A race in a setting..."
+    setting = tags.get('setting', 'unknown setting')
+    lighting = tags.get('lighting', 'unknown lighting')
+    people = tags.get('people', 'unknown number of people')
+
+    # Construct the prompt, handling the case where gender might be empty
+    gender_str = f" {gender}" if gender else "" # Add space only if gender is not empty
+
+    return (
+        f"A {race}{gender_str} in a {setting} setting, "
+        f"under {lighting} conditions, with {people} in frame."
+    )
+
+# --- Main Process ---
+def process_image(image_path):
+    if not os.path.exists(image_path):
+        print(f"Error: Image not found at {image_path}")
+        return None
+
+    # Check if image can be opened by PIL before proceeding
+    try:
+        Image.open(image_path).convert("RGB")
+    except Exception as e:
+        print(f"Error: Could not open or process image {image_path}: {e}")
+        return None
+
+    print(f"\n--- Starting analysis for image: {os.path.basename(image_path)} ---")
+
+    print("Extracting tags from image...")
+    tags = get_tags(image_path)
+    
+    if not tags:
+        print("Failed to extract any tags. Cannot generate prompt.")
+        return None
+
+    print("\n--- Extracted Tags Summary ---")
+    for k, v in tags.items():
+        print(f"  {k.capitalize()}: {v}")
+
+    print("\n--- Generating prompt from tags ---")
+    prompt = generate_prompt_from_tags(tags)
+    print("Generated Prompt:")
+    print(f"  \"{prompt}\"")
+
+    return prompt
+
+# --- Run it ---
+if __name__ == "__main__":
+    # Construct the image path dynamically for Desktop/AI_IMG_GPT
+    desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
+    ai_img_gpt_folder = os.path.join(desktop_path, "AI_IMG_GPT")
+    image_file_name = "thinking-doctor-scratching-head-male-holding-clipboard-reading-three-quarter-length-studio-shot-isolated-white-45237379.webp"
+    image_path = os.path.join(ai_img_gpt_folder, image_file_name)
+
+    final_generated_prompt = process_image(image_path)
+    if final_generated_prompt:
+        print(f"\nFinal Prompt: {final_generated_prompt}")
+    else:
+        print("\nPrompt generation failed.")
